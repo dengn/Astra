@@ -25,8 +25,10 @@ use super::version::{Dependency, Version};
 /// Intermediate deserialization target for SKILL.md YAML frontmatter.
 ///
 /// Skill manifest loaded from YAML/JSON.
+/// NOTE: no `deny_unknown_fields` — this struct must tolerate
+/// extra fields from Claude Code SKILL.md files that astra scans
+/// for compatibility (`.claude/skills/`, `.agent/skills/`).
 #[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawFrontmatter {
     name: String,
     #[serde(default)]
@@ -85,10 +87,69 @@ struct RawFrontmatter {
     effort: Option<String>,
     #[serde(default)]
     agent_type: Option<String>,
+    /// Silently accepted for cross-compatibility with CC SKILL.md files.
+    /// Astra does not allow skills to select model execution authority,
+    /// but tolerates the field in CC-originated frontmatter.
+    #[serde(default, skip_serializing)]
+    model: Option<String>,
+    /// Silently accept CC frontmatter fields that astra doesn't use.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    argument_hint: Option<String>,
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    disable_model_invocation: Option<bool>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Preprocess YAML frontmatter to quote bare values containing `: ` (colon-space).
+///
+/// Strict YAML parsers interpret `: ` as a mapping separator. Claude Code
+/// SKILL.md files often have unquoted `description:` values containing
+/// e.g. `"ANY: (1) 5+"` or `"触发场景**: 律麟问"`. This function wraps
+/// those values in double quotes so `serde_yaml_ng` doesn't reject them.
+///
+/// Only handles single-line key:value pairs. Multi-line YAML and already-quoted
+/// values pass through unchanged.
+fn preprocess_yaml_colons(yaml: &str) -> String {
+    let mut out = String::with_capacity(yaml.len() + 64);
+    for line in yaml.lines() {
+        let trimmed = line.trim();
+        // Pass through: empty lines, comments, block indicators, already-quoted
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('-')
+            || trimmed.starts_with('"')
+            || trimmed.starts_with('\'')
+        {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        // Check if this line is a simple `key: value` where the value contains `: `
+        if let Some(colon_pos) = trimmed.find(": ") {
+            let value = trimmed[colon_pos + 2..].trim();
+            if !value.is_empty()
+                && !value.starts_with('"')
+                && !value.starts_with('\'')
+                && !value.starts_with('[')
+                && !value.starts_with('{')
+                && value.contains(": ")
+            {
+                // Reconstruct with the original indentation + quoted value
+                let indent = &line[..line.len() - line.trim_start().len()];
+                let key = &trimmed[..colon_pos];
+                out.push_str(&format!("{}{}: \"{}\"\n", indent, key, value));
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -120,9 +181,14 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String), SkillErr
     })?;
 
     let yaml_content = rest[..end_marker].trim();
+    // Preprocess: quote unquoted values containing colon-space (": ")
+    // which strict YAML parsers interpret as mapping separators.
+    // This is common in Claude Code SKILL.md files where description
+    // values contain e.g. "ANY: (1) ..." or other colon-rich prose.
+    let yaml_content = preprocess_yaml_colons(yaml_content);
     let markdown_body = rest[end_marker + 4..].trim().to_string();
 
-    let raw: RawFrontmatter = serde_yaml_ng::from_str(yaml_content)
+    let raw: RawFrontmatter = serde_yaml_ng::from_str(&yaml_content)
         .map_err(|e| SkillError::ParseFailed(format!("Failed to parse YAML frontmatter: {e}")))?;
 
     validate_skill_name(&raw.name)?;
@@ -1391,11 +1457,15 @@ Hooked body."#;
     // ── Aliases / effort / agent_type frontmatter tests ─────────────────
 
     #[test]
-    fn skill_manifest_rejects_model_selection_authority() {
-        parse_skill_md(
-            "---\nname: governed-skill\ndescription: uses product policy\nmodel: provider-model\n---\nInstructions.",
+    fn skill_manifest_tolerates_cc_model_field() {
+        // Claude Code SKILL.md files may declare a `model` field.
+        // Astra silently ignores it — skills cannot select model execution.
+        let (manifest, body) = parse_skill_md(
+            "---\nname: governed-skill\ndescription: \"uses product policy\"\nmodel: provider-model\n---\nInstructions.",
         )
-        .expect_err("skills declare requirements; they cannot select model execution");
+        .expect("model field in frontmatter must be tolerated for CC compatibility");
+        assert_eq!(manifest.name, "governed-skill");
+        assert_eq!(body, "Instructions.");
     }
 
     #[test]
