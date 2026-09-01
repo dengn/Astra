@@ -334,9 +334,9 @@ pub use session_artifact_store::{
 pub use session_context_coordinator::{
     AcquireWriterOutcome, CoordinatorClock, DatabaseSessionContextCoordinator,
     FileSessionContextCoordinator, MaterializedConversationV1, ReserveTurnOutcome,
-    SessionAuthorityEventV1, SessionContextCoordinator, SessionContextCoordinatorError,
-    SystemCoordinatorClock, TransferWriterOutcome, WriterTransferConflictV1,
-    WriterTransferRequestV1,
+    SessionAdmissionSnapshotV1, SessionAuthorityEventV1, SessionContextCoordinator,
+    SessionContextCoordinatorError, SystemCoordinatorClock, TransferWriterOutcome,
+    WriterTransferConflictV1, WriterTransferRequestV1,
 };
 pub use session_fork::{
     ForkBasisDimension, ForkBasisDimensionEvidence, ForkBasisEntry, ForkSessionOptions,
