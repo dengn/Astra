@@ -899,8 +899,6 @@ pub(crate) async fn stream_chat_sse(
             promotion_events: Vec::new(),
             pending_context_assembly_trace: None,
             pending_context_trace_signal: None,
-            defer_remote_composite_snapshot_persistence: false,
-            pending_remote_composite_snapshot_index: None,
             completed_turns_for_tuning: 0,
             initial_skill_selector_shortlist: None,
         },
