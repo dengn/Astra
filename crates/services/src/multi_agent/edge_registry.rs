@@ -65,6 +65,105 @@ pub struct EdgeRegistrationLease {
     pub claim_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistrationTransition {
+    Finalize,
+    Release,
+    Rollback,
+}
+
+impl RegistrationTransition {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Finalize => "finalize",
+            Self::Release => "release",
+            Self::Rollback => "rollback",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RegistrationState {
+    edge_id: String,
+    claim_id: Option<String>,
+    state: i8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegistrationTransitionDecision {
+    AlreadyApplied,
+    Apply,
+    Superseded,
+}
+
+fn registration_transition_decision(
+    transition: RegistrationTransition,
+    lease: &EdgeRegistrationLease,
+    claim_id: &str,
+    row: Option<&RegistrationState>,
+) -> RegistrationTransitionDecision {
+    match transition {
+        RegistrationTransition::Finalize => match row {
+            Some(row)
+                if row.edge_id == lease.current.edge_id
+                    && row.claim_id.as_deref() == Some(claim_id)
+                    && row.state == 2 =>
+            {
+                RegistrationTransitionDecision::AlreadyApplied
+            }
+            Some(row) if row.claim_id.as_deref() == Some(claim_id) => {
+                RegistrationTransitionDecision::Apply
+            }
+            Some(row) if row.claim_id.as_deref() != Some(claim_id) => {
+                RegistrationTransitionDecision::Superseded
+            }
+            None | Some(_) => RegistrationTransitionDecision::Superseded,
+        },
+        RegistrationTransition::Release => match row {
+            Some(row)
+                if row.edge_id == lease.current.edge_id
+                    && row.claim_id.is_none()
+                    && row.state == 1 =>
+            {
+                RegistrationTransitionDecision::AlreadyApplied
+            }
+            Some(row) if row.claim_id.as_deref() == Some(claim_id) => {
+                RegistrationTransitionDecision::Apply
+            }
+            Some(row) if row.claim_id.as_deref() != Some(claim_id) => {
+                RegistrationTransitionDecision::Superseded
+            }
+            None | Some(_) => RegistrationTransitionDecision::Superseded,
+        },
+        RegistrationTransition::Rollback => match (&lease.previous, row) {
+            (None, None) => RegistrationTransitionDecision::AlreadyApplied,
+            (Some(previous), Some(row))
+                if row.edge_id == previous.edge_id && row.claim_id.is_none() && row.state == 1 =>
+            {
+                RegistrationTransitionDecision::AlreadyApplied
+            }
+            (_, Some(row)) if row.claim_id.as_deref() == Some(claim_id) => {
+                RegistrationTransitionDecision::Apply
+            }
+            (_, Some(_)) | (Some(_), None) => RegistrationTransitionDecision::Superseded,
+        },
+    }
+}
+
+async fn transition_error_with_rollback(
+    transaction: sqlx::Transaction<'_, sqlx::MySql>,
+    operation: &str,
+    registry_id: &str,
+    error: impl std::fmt::Display,
+) -> String {
+    match transaction.rollback().await {
+        Ok(()) => format!("edge_registry {operation} registration {registry_id}: {error}"),
+        Err(rollback_error) => format!(
+            "edge_registry {operation} registration {registry_id}: {error}; transaction rollback failed: {rollback_error}"
+        ),
+    }
+}
+
 /// Structured error for `EdgeRegistryService::heartbeat`.
 ///
 /// Callers must treat these two variants differently:
@@ -138,7 +237,8 @@ pub trait EdgeRegistryService: Send + Sync {
     }
 
     /// Undo a claimed generation only if it still owns the registry row.
-    /// Returns false when a newer generation has already taken over.
+    /// Returns true when the rollback is applied or was already applied, and
+    /// false only after verifying that another generation owns the row.
     async fn rollback_registration(&self, lease: &EdgeRegistrationLease) -> Result<bool, String> {
         match &lease.previous {
             Some(previous) => {
@@ -162,13 +262,17 @@ pub trait EdgeRegistryService: Send + Sync {
     }
 
     /// Release the cross-pod setup claim after the connection is published.
-    /// Backends without durable claim support have nothing to release.
+    /// Durable backends return true when release is applied or was already
+    /// applied, and false only after verifying that another generation owns
+    /// the row. Backends without durable claim support have nothing to release.
     async fn release_registration(&self, _lease: &EdgeRegistrationLease) -> Result<bool, String> {
         Ok(false)
     }
 
     /// Finalize the durable generation while retaining the cross-pod claim.
-    /// The default registration path is already final, so non-claiming
+    /// Durable backends return true when finalization is applied or was already
+    /// applied, and false only after verifying that another generation owns
+    /// the row. The default registration path is already final, so non-claiming
     /// backends have nothing else to do.
     async fn finalize_registration(&self, _lease: &EdgeRegistrationLease) -> Result<bool, String> {
         Ok(true)
@@ -266,6 +370,252 @@ impl DatabaseEdgeRegistryService {
     pub fn with_metrics(mut self, metrics: SharedMultiAgentMetrics) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    async fn load_registration_state_for_update(
+        transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+        registry_id: &str,
+    ) -> Result<Option<RegistrationState>, sqlx::Error> {
+        let row: Option<(String, Option<String>, i8)> = sqlx::query_as(
+            "SELECT edge_id, registration_claim_id, registration_state \
+             FROM edge_agent_registry WHERE user_id = ? AND registry_id = ? FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(registry_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        Ok(row.map(|(edge_id, claim_id, state)| RegistrationState {
+            edge_id,
+            claim_id,
+            state,
+        }))
+    }
+
+    async fn settle_registration_transition(
+        &self,
+        lease: &EdgeRegistrationLease,
+        transition: RegistrationTransition,
+    ) -> Result<bool, String> {
+        const MAX_ATTEMPTS: u32 = 6;
+        const BASE_BACKOFF_MS: u64 = 25;
+
+        let operation = transition.operation();
+        let registry_id = lease.current.registry_id.as_str();
+        let claim_id = lease.claim_id.as_deref().ok_or_else(|| {
+            format!("edge_registry {operation} registration {registry_id} has no durable claim")
+        })?;
+        let current_capabilities =
+            serialize_edge_capabilities(lease.current.capabilities.as_ref())?;
+        let previous_capabilities = match &lease.previous {
+            Some(previous) => serialize_edge_capabilities(previous.capabilities.as_ref())?,
+            None => None,
+        };
+
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                if let Some(ref metrics) = self.metrics {
+                    metrics.registry_retry_total.fetch_add(1, Ordering::Relaxed);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    BASE_BACKOFF_MS * (1 << (attempt - 1)),
+                ))
+                .await;
+            }
+
+            let mut transaction = self.pool.begin().await.map_err(|error| {
+                format!(
+                    "edge_registry {operation} registration {registry_id} begin (attempt {attempt}): {error}"
+                )
+            })?;
+            let before = match Self::load_registration_state_for_update(
+                &mut transaction,
+                &lease.current.user_id,
+                registry_id,
+            )
+            .await
+            {
+                Ok(row) => row,
+                Err(error) => {
+                    return Err(transition_error_with_rollback(
+                        transaction,
+                        operation,
+                        registry_id,
+                        format!("state lookup failed on attempt {attempt}: {error}"),
+                    )
+                    .await);
+                }
+            };
+
+            if before.is_none()
+                && !(transition == RegistrationTransition::Rollback && lease.previous.is_none())
+                && attempt + 1 < MAX_ATTEMPTS
+            {
+                transaction.rollback().await.map_err(|error| {
+                    format!(
+                        "edge_registry {operation} registration {registry_id} retry rollback (attempt {attempt}): {error}"
+                    )
+                })?;
+                continue;
+            }
+
+            let before_decision =
+                registration_transition_decision(transition, lease, claim_id, before.as_ref());
+            match before_decision {
+                RegistrationTransitionDecision::AlreadyApplied => {
+                    transaction.commit().await.map_err(|error| {
+                        format!(
+                            "edge_registry {operation} registration {registry_id} verification commit: {error}"
+                        )
+                    })?;
+                    return Ok(true);
+                }
+                RegistrationTransitionDecision::Superseded => {
+                    transaction.rollback().await.map_err(|error| {
+                        format!(
+                            "edge_registry {operation} registration {registry_id} superseded rollback: {error}"
+                        )
+                    })?;
+                    return Ok(false);
+                }
+                RegistrationTransitionDecision::Apply => {}
+            }
+
+            let execution = match transition {
+                RegistrationTransition::Finalize => {
+                    sqlx::query(
+                        "UPDATE edge_agent_registry \
+                         SET edge_id = ?, hostname = ?, worktree_path = ?, capabilities_json = ?, \
+                             workspace_id = ?, last_heartbeat_at = NOW(6), registration_state = 2, \
+                             registration_previous_edge_id = ? \
+                         WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
+                    )
+                    .bind(&lease.current.edge_id)
+                    .bind(&lease.current.hostname)
+                    .bind(&lease.current.worktree_path)
+                    .bind(&current_capabilities)
+                    .bind(&lease.current.workspace_id)
+                    .bind(
+                        lease
+                            .previous
+                            .as_ref()
+                            .map(|previous| previous.edge_id.as_str()),
+                    )
+                    .bind(&lease.current.user_id)
+                    .bind(registry_id)
+                    .bind(claim_id)
+                    .execute(&mut *transaction)
+                    .await
+                }
+                RegistrationTransition::Release => {
+                    sqlx::query(
+                        "UPDATE edge_agent_registry \
+                         SET registration_claim_id = NULL, registration_claim_expires_at = NULL, \
+                             registration_state = 1, registration_previous_edge_id = NULL \
+                         WHERE user_id = ? AND registry_id = ? AND edge_id = ? \
+                           AND registration_claim_id = ? AND registration_state = 2",
+                    )
+                    .bind(&lease.current.user_id)
+                    .bind(registry_id)
+                    .bind(&lease.current.edge_id)
+                    .bind(claim_id)
+                    .execute(&mut *transaction)
+                    .await
+                }
+                RegistrationTransition::Rollback => match &lease.previous {
+                    Some(previous) => {
+                        sqlx::query(
+                            "UPDATE edge_agent_registry \
+                             SET edge_id = ?, hostname = ?, worktree_path = ?, capabilities_json = ?, \
+                                 workspace_id = ?, last_heartbeat_at = NOW(6), \
+                                 registration_claim_id = NULL, registration_claim_expires_at = NULL, \
+                                 registration_state = 1, registration_previous_edge_id = NULL \
+                             WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
+                        )
+                        .bind(&previous.edge_id)
+                        .bind(&previous.hostname)
+                        .bind(&previous.worktree_path)
+                        .bind(&previous_capabilities)
+                        .bind(&previous.workspace_id)
+                        .bind(&lease.current.user_id)
+                        .bind(registry_id)
+                        .bind(claim_id)
+                        .execute(&mut *transaction)
+                        .await
+                    }
+                    None => {
+                        sqlx::query(
+                            "DELETE FROM edge_agent_registry \
+                             WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
+                        )
+                        .bind(&lease.current.user_id)
+                        .bind(registry_id)
+                        .bind(claim_id)
+                        .execute(&mut *transaction)
+                        .await
+                    }
+                },
+            };
+            if let Err(error) = execution {
+                return Err(transition_error_with_rollback(
+                    transaction,
+                    operation,
+                    registry_id,
+                    format!("mutation failed on attempt {attempt}: {error}"),
+                )
+                .await);
+            }
+
+            let after = match Self::load_registration_state_for_update(
+                &mut transaction,
+                &lease.current.user_id,
+                registry_id,
+            )
+            .await
+            {
+                Ok(row) => row,
+                Err(error) => {
+                    return Err(transition_error_with_rollback(
+                        transaction,
+                        operation,
+                        registry_id,
+                        format!("state verification failed on attempt {attempt}: {error}"),
+                    )
+                    .await);
+                }
+            };
+            let after_decision =
+                registration_transition_decision(transition, lease, claim_id, after.as_ref());
+            match after_decision {
+                RegistrationTransitionDecision::AlreadyApplied => {
+                    transaction.commit().await.map_err(|error| {
+                        format!(
+                            "edge_registry {operation} registration {registry_id} commit (attempt {attempt}): {error}"
+                        )
+                    })?;
+                    return Ok(true);
+                }
+                RegistrationTransitionDecision::Superseded => {
+                    transaction.rollback().await.map_err(|error| {
+                        format!(
+                            "edge_registry {operation} registration {registry_id} verification rollback (attempt {attempt}): {error}"
+                        )
+                    })?;
+                    return Ok(false);
+                }
+                RegistrationTransitionDecision::Apply => {
+                    transaction.rollback().await.map_err(|error| {
+                        format!(
+                            "edge_registry {operation} registration {registry_id} retry rollback (attempt {attempt}): {error}"
+                        )
+                    })?;
+                }
+            }
+        }
+
+        Err(format!(
+            "edge_registry {operation} registration {registry_id} remained owned but did not reach its target state after {MAX_ATTEMPTS} attempts"
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -788,104 +1138,27 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             )
             .await;
         };
-        let Some(previous) = &lease.previous else {
-            let deleted = sqlx::query(
-                "DELETE FROM edge_agent_registry \
-                 WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
-            )
-            .bind(&lease.current.user_id)
-            .bind(&lease.current.registry_id)
-            .bind(claim_id)
-            .execute(&self.pool)
+        debug_assert!(!claim_id.is_empty());
+        self.settle_registration_transition(lease, RegistrationTransition::Rollback)
             .await
-            .map_err(|e| format!("edge_registry rollback inserted registration: {e}"))?;
-            return Ok(deleted.rows_affected() > 0);
-        };
-        let capabilities_json = previous
-            .capabilities
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| format!("edge_registry rollback capabilities json: {e}"))?;
-        let restored = sqlx::query(
-            "UPDATE edge_agent_registry \
-             SET edge_id = ?, hostname = ?, worktree_path = ?, capabilities_json = ?, \
-                 workspace_id = ?, last_heartbeat_at = NOW(6), \
-                 registration_claim_id = NULL, registration_claim_expires_at = NULL, \
-                 registration_state = 1, registration_previous_edge_id = NULL \
-             WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
-        )
-        .bind(&previous.edge_id)
-        .bind(&previous.hostname)
-        .bind(&previous.worktree_path)
-        .bind(&capabilities_json)
-        .bind(&previous.workspace_id)
-        .bind(&lease.current.user_id)
-        .bind(&lease.current.registry_id)
-        .bind(claim_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("edge_registry rollback registration: {e}"))?;
-        Ok(restored.rows_affected() > 0)
     }
 
     async fn finalize_registration(&self, lease: &EdgeRegistrationLease) -> Result<bool, String> {
         let Some(claim_id) = lease.claim_id.as_deref() else {
             return Ok(true);
         };
-        let capabilities_json = lease
-            .current
-            .capabilities
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| format!("edge_registry finalize capabilities json: {e}"))?;
-        let finalized = sqlx::query(
-            "UPDATE edge_agent_registry \
-             SET edge_id = ?, hostname = ?, worktree_path = ?, capabilities_json = ?, \
-                 workspace_id = ?, last_heartbeat_at = NOW(6), registration_state = 2, \
-                 registration_previous_edge_id = ? \
-             WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
-        )
-        .bind(&lease.current.edge_id)
-        .bind(&lease.current.hostname)
-        .bind(&lease.current.worktree_path)
-        .bind(&capabilities_json)
-        .bind(&lease.current.workspace_id)
-        .bind(
-            lease
-                .previous
-                .as_ref()
-                .map(|previous| previous.edge_id.as_str()),
-        )
-        .bind(&lease.current.user_id)
-        .bind(&lease.current.registry_id)
-        .bind(claim_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("edge_registry finalize registration: {e}"))?;
-        Ok(finalized.rows_affected() > 0)
+        debug_assert!(!claim_id.is_empty());
+        self.settle_registration_transition(lease, RegistrationTransition::Finalize)
+            .await
     }
 
     async fn release_registration(&self, lease: &EdgeRegistrationLease) -> Result<bool, String> {
         let Some(claim_id) = lease.claim_id.as_deref() else {
             return Ok(false);
         };
-        let released = sqlx::query(
-            "UPDATE edge_agent_registry \
-             SET registration_claim_id = NULL, registration_claim_expires_at = NULL, \
-                 registration_state = 1, registration_previous_edge_id = NULL \
-             WHERE user_id = ? AND registry_id = ? AND edge_id = ? \
-               AND registration_claim_id = ? AND registration_state = 2",
-        )
-        .bind(&lease.current.user_id)
-        .bind(&lease.current.registry_id)
-        .bind(&lease.current.edge_id)
-        .bind(claim_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("edge_registry release registration claim: {e}"))?;
-        Ok(released.rows_affected() > 0)
+        debug_assert!(!claim_id.is_empty());
+        self.settle_registration_transition(lease, RegistrationTransition::Release)
+            .await
     }
 
     async fn current_edge_id(
@@ -1048,6 +1321,114 @@ impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn registration_lease(previous_edge_id: Option<&str>) -> EdgeRegistrationLease {
+        let record = |edge_id: &str| EdgeAgentRecord {
+            registry_id: "registry-1".to_string(),
+            user_id: "user-1".to_string(),
+            edge_agent_id: "agent-1".to_string(),
+            edge_id: edge_id.to_string(),
+            hostname: None,
+            worktree_path: None,
+            capabilities: None,
+            workspace_id: Some("workspace-1".to_string()),
+            registered_at: "2026-09-02 00:00:00.000000".to_string(),
+            last_heartbeat_at: "2026-09-02 00:00:00.000000".to_string(),
+        };
+        EdgeRegistrationLease {
+            current: record("edge-new"),
+            previous: previous_edge_id.map(record),
+            claim_id: Some("claim-1".to_string()),
+        }
+    }
+
+    fn registration_state(edge_id: &str, claim_id: Option<&str>, state: i8) -> RegistrationState {
+        RegistrationState {
+            edge_id: edge_id.to_string(),
+            claim_id: claim_id.map(ToString::to_string),
+            state,
+        }
+    }
+
+    #[test]
+    fn release_retries_an_owned_finalized_claim_and_accepts_idempotent_success() {
+        let lease = registration_lease(Some("edge-old"));
+        let before_finalize = registration_state("edge-old", Some("claim-1"), 1);
+        assert_eq!(
+            registration_transition_decision(
+                RegistrationTransition::Release,
+                &lease,
+                "claim-1",
+                Some(&before_finalize),
+            ),
+            RegistrationTransitionDecision::Apply,
+            "the same claim may still expose its pre-finalize row through another DB session"
+        );
+
+        let owned = registration_state("edge-new", Some("claim-1"), 2);
+        assert_eq!(
+            registration_transition_decision(
+                RegistrationTransition::Release,
+                &lease,
+                "claim-1",
+                Some(&owned),
+            ),
+            RegistrationTransitionDecision::Apply
+        );
+
+        let released = registration_state("edge-new", None, 1);
+        assert_eq!(
+            registration_transition_decision(
+                RegistrationTransition::Release,
+                &lease,
+                "claim-1",
+                Some(&released),
+            ),
+            RegistrationTransitionDecision::AlreadyApplied
+        );
+    }
+
+    #[test]
+    fn registration_transition_only_reports_superseded_for_a_different_claim() {
+        let lease = registration_lease(Some("edge-old"));
+        let successor = registration_state("edge-successor", Some("claim-2"), 1);
+        for transition in [
+            RegistrationTransition::Finalize,
+            RegistrationTransition::Release,
+            RegistrationTransition::Rollback,
+        ] {
+            assert_eq!(
+                registration_transition_decision(transition, &lease, "claim-1", Some(&successor),),
+                RegistrationTransitionDecision::Superseded
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_accepts_both_restored_and_deleted_idempotent_states() {
+        let replacement = registration_lease(Some("edge-old"));
+        let restored = registration_state("edge-old", None, 1);
+        assert_eq!(
+            registration_transition_decision(
+                RegistrationTransition::Rollback,
+                &replacement,
+                "claim-1",
+                Some(&restored),
+            ),
+            RegistrationTransitionDecision::AlreadyApplied
+        );
+
+        let first_registration = registration_lease(None);
+        assert_eq!(
+            registration_transition_decision(
+                RegistrationTransition::Rollback,
+                &first_registration,
+                "claim-1",
+                None,
+            ),
+            RegistrationTransitionDecision::AlreadyApplied
+        );
+    }
 
     #[test]
     fn edge_agent_record_projection_extracts_matrixone_json_as_unbounded_text() {
