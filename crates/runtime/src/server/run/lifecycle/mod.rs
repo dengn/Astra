@@ -12059,9 +12059,63 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
 
+                // The terminal status and its durable evidence form one
+                // externally observable completion boundary. Finish every
+                // mandatory write before publishing terminal SSE so a client
+                // cannot observe success while usage, transcript evidence, or
+                // projections are still vulnerable to process termination.
+                // These stores are independent after the terminal CAS, so keep
+                // their latency overlapped.
+                let persist_usage = async {
+                    astra_core::log_persist!(
+                        run_engine
+                            .persist_usage(
+                                &bg_user_id,
+                                &bg_run_id,
+                                state.provider_input_tokens(),
+                                state.total_completion,
+                                state.total_tool_calls,
+                            )
+                            .await,
+                        "run_lifecycle",
+                        &bg_run_id,
+                        "usage"
+                    );
+                };
+                let materialize_transcript = async {
+                    if let Err(e) = persist_ctx
+                        .materialize_run_transcript_evidence(&state)
+                        .await
+                    {
+                        tracing::warn!(
+                            session_id = %bg_session_id,
+                            run_id = %bg_run_id,
+                            error = %e,
+                            "durable transcript evidence materialization failed"
+                        );
+                    }
+                };
+                let post_loop_persistence = persist_ctx.run_after_core(
+                    &state,
+                    loop_success,
+                    core_trace_result,
+                    canonical_context_persisted,
+                );
+                let (_, _, post_loop_result) =
+                    tokio::join!(persist_usage, materialize_transcript, post_loop_persistence,);
+                if let Err(e) = post_loop_result {
+                    tracing::error!(
+                        session_id = %bg_session_id,
+                        run_id = %bg_run_id,
+                        error = %e,
+                        "post-loop persistence failed"
+                    );
+                }
+
                 // Keep the owner lease through terminal CAS/event repair, then
-                // release it before client fanout and post-loop cleanup. These
-                // side effects must not advertise a live resume/input consumer.
+                // release it before client fanout and non-durable cleanup.
+                // Cleanup side effects must not advertise a live resume/input
+                // consumer.
                 drop(_owner_lease_heartbeat);
 
                 if publish_stream_terminal {
@@ -12117,58 +12171,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
 
                 drop(event_tx);
-
-                // Usage, transcript evidence, projections, and observers all
-                // derive from the canonical journal/context and the already
-                // committed terminal run. They do not participate in terminal
-                // status selection, so close the client first and settle these
-                // disjoint stores concurrently. The background task still owns
-                // and awaits every write before releasing its run permit.
-                let persist_usage = async {
-                    astra_core::log_persist!(
-                        run_engine
-                            .persist_usage(
-                                &bg_user_id,
-                                &bg_run_id,
-                                state.provider_input_tokens(),
-                                state.total_completion,
-                                state.total_tool_calls,
-                            )
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "usage"
-                    );
-                };
-                let materialize_transcript = async {
-                    if let Err(e) = persist_ctx
-                        .materialize_run_transcript_evidence(&state)
-                        .await
-                    {
-                        tracing::warn!(
-                            session_id = %bg_session_id,
-                            run_id = %bg_run_id,
-                            error = %e,
-                            "durable transcript evidence materialization failed"
-                        );
-                    }
-                };
-                let post_loop_persistence = persist_ctx.run_after_core(
-                    &state,
-                    loop_success,
-                    core_trace_result,
-                    canonical_context_persisted,
-                );
-                let (_, _, post_loop_result) =
-                    tokio::join!(persist_usage, materialize_transcript, post_loop_persistence,);
-                if let Err(e) = post_loop_result {
-                    tracing::error!(
-                        session_id = %bg_session_id,
-                        run_id = %bg_run_id,
-                        error = %e,
-                        "post-loop persistence failed"
-                    );
-                }
 
                 // Post-loop memory cleanup — identical to `create_run`. Runs
                 // AFTER event_tx drops; default async mode schedules external

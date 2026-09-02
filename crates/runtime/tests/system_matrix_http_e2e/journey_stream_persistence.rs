@@ -848,8 +848,8 @@ pub async fn run_stream_multi_turn_persistence() {
         &body1[..body1.len().min(200)]
     );
 
-    // Context-trace projection runs after the terminal SSE boundary, so wait
-    // for each turn-owned event type instead of an ambiguous total row count.
+    // Wait for each turn-owned event type instead of an ambiguous total row
+    // count that can be satisfied by unrelated trace-detail rows.
     wait_for_agent_event_type_counts(
         pool,
         user_id,

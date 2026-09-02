@@ -241,9 +241,9 @@ impl PostLoopPersistContext {
         .await;
 
         // The remaining consumers all read the immutable completed loop state
-        // and write independent sinks. Callers may run this projection phase
-        // after publishing the already durable terminal boundary; the writes
-        // here are still awaited together before lifecycle cleanup completes.
+        // and write independent sinks. Streaming callers complete this phase
+        // before publishing terminal SSE; the writes are awaited together so
+        // their independent database latency remains overlapped.
         let hook_persist = async {
             let Some(writer) = self.hook_db_writer.as_ref() else {
                 return Ok(());
