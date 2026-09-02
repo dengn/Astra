@@ -90,8 +90,14 @@ fn cancelled_turn_without_a_delta_does_not_become_a_commit_failure() {
 #[test]
 fn compaction_commits_the_complete_replacement_projection() {
     let prior = vec![json!({"role": "user", "content": "old"})];
-    let base_root = astra_turn_types::canonical_conversation_root(&prior);
-    let mut proof = CanonicalRewriteProof::new(&prior, &base_root, 0);
+    let base_manifest_root = "a".repeat(64);
+    assert_ne!(
+        base_manifest_root,
+        astra_turn_types::canonical_conversation_root(&prior),
+        "the regression requires distinct manifest and conversation hash domains"
+    );
+    let mut proof =
+        CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
     let permit = proof.begin(&prior);
     let compacted = vec![
         json!({"role": "user", "content": "summary"}),
@@ -104,6 +110,7 @@ fn compaction_commits_the_complete_replacement_projection() {
 
     assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
     assert_eq!(packs.concat(), compacted);
+    assert_eq!(proof.base_manifest_root(), base_manifest_root);
 }
 
 #[test]
@@ -120,8 +127,9 @@ fn unexplained_canonical_prefix_shrink_remains_rejected() {
 fn unrelated_prefix_mutation_after_compaction_is_rejected() {
     let prior = vec![json!({"role": "user", "content": "committed"})];
     let compacted = vec![json!({"role": "system", "content": "summary"})];
-    let base_root = astra_turn_types::canonical_conversation_root(&prior);
-    let mut proof = CanonicalRewriteProof::new(&prior, &base_root, 0);
+    let base_manifest_root = "a".repeat(64);
+    let mut proof =
+        CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
     let permit = proof.begin(&prior);
     proof.finish(permit, &compacted);
 
@@ -136,8 +144,9 @@ fn compaction_cannot_authorize_an_already_mutated_prefix() {
     let prior = vec![json!({"role": "user", "content": "committed"})];
     let mutated_before_compaction = vec![json!({"role": "user", "content": "unrelated mutation"})];
     let compacted = vec![json!({"role": "system", "content": "summary"})];
-    let base_root = astra_turn_types::canonical_conversation_root(&prior);
-    let mut proof = CanonicalRewriteProof::new(&prior, &base_root, 0);
+    let base_manifest_root = "a".repeat(64);
+    let mut proof =
+        CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
     let permit = proof.begin(&mutated_before_compaction);
     proof.finish(permit, &compacted);
 

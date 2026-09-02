@@ -2443,15 +2443,16 @@ impl AgenticLoopState {
     pub(crate) fn initialize_canonical_rewrite_proof(
         &mut self,
         admitted_prefix: &[Value],
-        base_root: &str,
+        base_manifest_root: &str,
         base_compaction_generation: u64,
     ) {
-        self.canonical_rewrite_state.proof =
-            Some(crate::turn::canonical_commit::CanonicalRewriteProof::new(
+        self.canonical_rewrite_state.proof = Some(
+            crate::turn::canonical_commit::CanonicalRewriteProof::from_materialized_admission(
                 admitted_prefix,
-                base_root,
+                base_manifest_root,
                 base_compaction_generation,
-            ));
+            ),
+        );
     }
 
     pub(crate) fn canonical_rewrite_proof(
