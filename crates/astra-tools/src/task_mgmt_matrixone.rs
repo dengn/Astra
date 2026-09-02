@@ -543,7 +543,8 @@ impl TaskStore for MatrixOneTaskStore {
                 "session_todo_counters.version out of range for {session_id}: {raw_version}"
             ));
         }
-        let next_task_id = peek_task_id_from_counter(Some(raw_next), session_id)?;
+        let next_task_id = peek_task_id_from_counter(Some(raw_next), session_id)
+            .map_err(|error| format!("peek_next_task_id failed: {error}"))?;
         let version = u64::try_from(raw_version)
             .map_err(|_| format!("session_todo_counters.version overflow for {session_id}"))?;
         let mut tasks = Vec::with_capacity(rows.len());

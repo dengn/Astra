@@ -69,7 +69,7 @@ fn latest_context_trace_signal(
 ) -> Option<astra_services::session_workspace::ContextTraceSignal> {
     let session = state.telemetry.observability_session.as_ref()?;
     {
-        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
+        let guard = astra_core::sync_poison::recover_rwlock_read(session);
         crate::observability::latest_context_trace_signal(&guard)
     }
 }
