@@ -11139,7 +11139,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &pause_flag,
             (*llm_cancel_token).clone(),
         );
-        state.telemetry.defer_remote_composite_snapshot_persistence = true;
         configure_runtime_controllers(
             &self.matrixone,
             self.shared_pool.as_ref(),
@@ -11645,11 +11644,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     "host event bridge settled"
                 );
                 let root_mailbox = state.messaging.mailbox.take();
-                let remote_snapshot_persistence = state.telemetry.context_trace_persistence.clone();
-                let pending_remote_snapshot = state
-                    .telemetry
-                    .pending_remote_composite_snapshot_index
-                    .take();
                 let user_transcript_persisted = match user_transcript_persistence.await {
                     Ok(persisted) => persisted,
                     Err(error) => {
@@ -11703,13 +11697,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     );
                     (loop_result, canonical_context_persisted, core_trace_result)
                 };
-                let ((loop_result, canonical_context_persisted, core_trace_result), (), ()) = tokio::join!(
+                let ((loop_result, canonical_context_persisted, core_trace_result), ()) = tokio::join!(
                     persist_canonical_state,
                     park_server_root_mailbox(root_mailbox),
-                    crate::turn::agentic_loop::finalization::persist_deferred_remote_composite_snapshot_index(
-                        remote_snapshot_persistence,
-                        pending_remote_snapshot,
-                    ),
                 );
                 tracing::info!(
                     target: "astra_runtime::timing",

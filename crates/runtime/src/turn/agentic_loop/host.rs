@@ -1101,17 +1101,6 @@ pub struct TelemetryState {
     /// durable terminal boundary. Context trace is observability data, not an
     /// input to turn outcome selection, so it must not extend the live turn.
     pub pending_context_trace_signal: Option<astra_services::session_workspace::ContextTraceSignal>,
-    /// Server runtimes defer the remote composite-snapshot projection until
-    /// the post-loop durability phase, where it can run alongside independent
-    /// canonical persistence. CLI runtimes keep the synchronous behavior.
-    pub defer_remote_composite_snapshot_persistence: bool,
-    /// Latest locally committed composite-snapshot index awaiting its remote
-    /// projection. The index is cumulative, so a newer checkpoint supersedes
-    /// an older pending projection without losing recovery state.
-    pub pending_remote_composite_snapshot_index: Option<(
-        String,
-        astra_core::composite_snapshot::CompositeSnapshotIndex,
-    )>,
 }
 
 #[derive(Clone, Debug)]

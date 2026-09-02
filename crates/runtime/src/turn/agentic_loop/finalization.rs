@@ -264,31 +264,6 @@ fn persist_remote_composite_snapshot_index_blocking(
     }
 }
 
-pub(crate) async fn persist_deferred_remote_composite_snapshot_index(
-    persistence: Option<crate::turn::agentic_loop::host::ContextTracePersistenceContext>,
-    pending: Option<(
-        String,
-        astra_core::composite_snapshot::CompositeSnapshotIndex,
-    )>,
-) {
-    let (Some(persistence), Some((session_id, index))) = (persistence, pending) else {
-        return;
-    };
-    if let Err(error) = astra_services::session_restore::persist_remote_composite_snapshot_index(
-        &session_id,
-        &persistence.user_id,
-        &index,
-        &persistence.artifact_store,
-    )
-    .await
-    {
-        astra_core::agent_warn!(
-            "checkpoint",
-            "Failed to persist remote composite snapshot index for {session_id}: {error}"
-        );
-    }
-}
-
 fn checkpoint_blocked_tools(restricted_tools: &std::collections::HashSet<String>) -> Vec<String> {
     let mut blocked_tools: Vec<String> = restricted_tools.iter().cloned().collect();
     blocked_tools.sort();
@@ -526,17 +501,12 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         // checkpoint can re-attempt without referencing a half-written index.
         return;
     }
-    if state.telemetry.defer_remote_composite_snapshot_persistence {
-        state.telemetry.pending_remote_composite_snapshot_index =
-            Some((sid.clone(), index.clone()));
-    } else {
-        persist_remote_composite_snapshot_index_blocking(
-            state,
-            sid,
-            &index,
-            "persist remote composite snapshot index",
-        );
-    }
+    persist_remote_composite_snapshot_index_blocking(
+        state,
+        sid,
+        &index,
+        "persist remote composite snapshot index",
+    );
 
     state.last_composite_snapshot = Some(snapshot);
     state.stall.last_heavy_checkpoint = Some(cp);
