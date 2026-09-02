@@ -719,7 +719,7 @@ async fn edge_registry_concurrent_register() {
 async fn edge_registry_registration_lease_restores_the_exact_predecessor() {
     require_env();
     let pool = common::setup_pool().await.get().clone();
-    let svc = DatabaseEdgeRegistryService::new(pool);
+    let svc = DatabaseEdgeRegistryService::new(pool.clone());
 
     let user_id = format!("user_{}", unique_suffix());
     let edge_agent_id = format!("agent_{}", unique_suffix());
@@ -780,6 +780,12 @@ async fn edge_registry_registration_lease_restores_the_exact_predecessor() {
             .await
             .expect("rollback replacement")
     );
+    assert!(
+        svc.rollback_registration(&replacement)
+            .await
+            .expect("repeat rollback replacement"),
+        "an already restored predecessor is an idempotent rollback success"
+    );
 
     let restored = svc
         .list_by_user(&user_id)
@@ -793,6 +799,16 @@ async fn edge_registry_registration_lease_restores_the_exact_predecessor() {
     assert_eq!(restored.worktree_path.as_deref(), Some("/old/worktree"));
     assert_eq!(restored.capabilities, Some(old_capabilities));
     assert_eq!(restored.workspace_id.as_deref(), Some("workspace-old"));
+    let persisted: (String, i8, Option<String>) = sqlx::query_as(
+        "SELECT edge_id, registration_state, registration_claim_id \
+         FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&edge_agent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read persisted rollback state");
+    assert_eq!(persisted, (old_edge_id, 1, None));
 }
 
 #[tokio::test]
@@ -800,7 +816,7 @@ async fn edge_registry_registration_lease_restores_the_exact_predecessor() {
 async fn edge_registry_two_phase_registration_keeps_pending_metadata_unroutable() {
     require_env();
     let pool = common::setup_pool().await.get().clone();
-    let svc = DatabaseEdgeRegistryService::new(pool);
+    let svc = DatabaseEdgeRegistryService::new(pool.clone());
     let user_id = format!("user_{}", unique_suffix());
     let edge_agent_id = format!("agent_{}", unique_suffix());
 
@@ -844,18 +860,32 @@ async fn edge_registry_two_phase_registration_keeps_pending_metadata_unroutable(
 
     assert!(svc.finalize_registration(&pending).await.unwrap());
     assert!(
+        svc.finalize_registration(&pending).await.unwrap(),
+        "finalization must be idempotent while the same claim is retained"
+    );
+    assert!(
         svc.list_by_user(&user_id).await.unwrap().is_empty(),
         "finalized generation stays unroutable until pool commit releases the claim"
     );
     assert!(svc.release_registration(&pending).await.unwrap());
     assert!(
-        !svc.release_registration(&pending).await.unwrap(),
-        "a committed claim cannot be released twice"
+        svc.release_registration(&pending).await.unwrap(),
+        "an already committed claim is an idempotent release success"
     );
     let current = svc.list_by_user(&user_id).await.unwrap();
     assert_eq!(current.len(), 1);
     assert_eq!(current[0].edge_id, "edge-new");
     assert_eq!(current[0].workspace_id.as_deref(), Some("workspace-new"));
+    let persisted: (String, i8, Option<String>) = sqlx::query_as(
+        "SELECT edge_id, registration_state, registration_claim_id \
+         FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&edge_agent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read persisted release state");
+    assert_eq!(persisted, ("edge-new".to_string(), 1, None));
 }
 
 #[tokio::test]
