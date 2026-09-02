@@ -61,27 +61,30 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
         state.telemetry.pending_context_assembly_trace =
             Some((session_turn, trace.to_json_value()));
     }
-    persist_latest_context_trace_signal(state).await;
+    state.telemetry.pending_context_trace_signal = latest_context_trace_signal(state);
 }
 
-async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
-    let (session_id, persistence, session) = match (
-        state.current_session_id.as_deref(),
-        state.telemetry.context_trace_persistence.clone(),
-        state.telemetry.observability_session.clone(),
-    ) {
-        (Some(session_id), Some(persistence), Some(session)) if !session_id.is_empty() => {
-            (session_id.to_string(), persistence, session)
-        }
-        _ => return,
-    };
-    let signal = {
+fn latest_context_trace_signal(
+    state: &AgenticLoopState,
+) -> Option<astra_services::session_workspace::ContextTraceSignal> {
+    let session = state.telemetry.observability_session.as_ref()?;
+    {
         let guard = astra_core::sync_poison::recover_rwlock_read(&session);
         crate::observability::latest_context_trace_signal(&guard)
-    };
-    let Some(signal) = signal else {
+    }
+}
+
+pub(crate) async fn persist_deferred_context_trace_signal(
+    session_id: String,
+    persistence: Option<super::host::ContextTracePersistenceContext>,
+    signal: Option<astra_services::session_workspace::ContextTraceSignal>,
+) {
+    let (Some(persistence), Some(signal)) = (persistence, signal) else {
         return;
     };
+    if session_id.is_empty() {
+        return;
+    }
 
     persist_context_trace_to_workspace_if_present(
         session_id.clone(),
@@ -257,6 +260,31 @@ fn persist_remote_composite_snapshot_index_blocking(
         astra_core::agent_warn!(
             "checkpoint",
             "Failed to {source} for {session_id_for_log}: {error}"
+        );
+    }
+}
+
+pub(crate) async fn persist_deferred_remote_composite_snapshot_index(
+    persistence: Option<crate::turn::agentic_loop::host::ContextTracePersistenceContext>,
+    pending: Option<(
+        String,
+        astra_core::composite_snapshot::CompositeSnapshotIndex,
+    )>,
+) {
+    let (Some(persistence), Some((session_id, index))) = (persistence, pending) else {
+        return;
+    };
+    if let Err(error) = astra_services::session_restore::persist_remote_composite_snapshot_index(
+        &session_id,
+        &persistence.user_id,
+        &index,
+        &persistence.artifact_store,
+    )
+    .await
+    {
+        astra_core::agent_warn!(
+            "checkpoint",
+            "Failed to persist remote composite snapshot index for {session_id}: {error}"
         );
     }
 }
@@ -498,12 +526,17 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         // checkpoint can re-attempt without referencing a half-written index.
         return;
     }
-    persist_remote_composite_snapshot_index_blocking(
-        state,
-        sid,
-        &index,
-        "persist remote composite snapshot index",
-    );
+    if state.telemetry.defer_remote_composite_snapshot_persistence {
+        state.telemetry.pending_remote_composite_snapshot_index =
+            Some((sid.clone(), index.clone()));
+    } else {
+        persist_remote_composite_snapshot_index_blocking(
+            state,
+            sid,
+            &index,
+            "persist remote composite snapshot index",
+        );
+    }
 
     state.last_composite_snapshot = Some(snapshot);
     state.stall.last_heavy_checkpoint = Some(cp);

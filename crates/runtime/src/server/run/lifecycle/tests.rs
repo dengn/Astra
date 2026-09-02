@@ -5942,6 +5942,7 @@ fn authorized_edge_dispatch_request() -> astra_services::runs::ChatRequestData {
             mcp: None,
             skills: None,
             edge_agent: Some(descriptor),
+            discovery_snapshot: None,
         });
     request
 }
@@ -6148,6 +6149,7 @@ async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_
             mcp: None,
             skills: None,
             edge_agent: None,
+            discovery_snapshot: None,
         });
 
     let prepared = service
@@ -6191,6 +6193,7 @@ async fn validate_request_constraints_rejects_descriptor_without_provider_author
             mcp: None,
             skills: None,
             edge_agent: None,
+            discovery_snapshot: None,
         });
 
     let err = service
@@ -7336,7 +7339,7 @@ fn merge_cancelled_run_events_preserves_order_and_usage() {
 }
 
 #[test]
-fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
+fn terminal_events_for_persistence_excludes_live_only_reasoning_markers() {
     let events = vec![
         json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
         json!({"type": "reasoning_delta", "content": "thinking"}),
@@ -7353,14 +7356,16 @@ fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
     ];
 
     let persisted = terminal_events_for_persistence(&events);
-    assert_eq!(persisted.len(), 7);
-    assert_eq!(persisted[0]["type"], "reasoning_done");
-    assert_eq!(persisted[1]["type"], "thinking_done");
-    assert_eq!(persisted[2]["type"], "runtime.control.handoff.requested");
-    assert_eq!(persisted[3]["type"], "runtime.control.handoff.rejected");
-    assert_eq!(persisted[4]["event_type"], "text_done");
-    assert_eq!(persisted[5]["event_type"], "run_error");
-    assert_eq!(persisted[6]["event_type"], "run_finished");
+    assert_eq!(persisted.len(), 5);
+    assert!(persisted.iter().all(|event| !matches!(
+        event["type"].as_str(),
+        Some("reasoning_done" | "thinking_done")
+    )));
+    assert_eq!(persisted[0]["type"], "runtime.control.handoff.requested");
+    assert_eq!(persisted[1]["type"], "runtime.control.handoff.rejected");
+    assert_eq!(persisted[2]["event_type"], "text_done");
+    assert_eq!(persisted[3]["event_type"], "run_error");
+    assert_eq!(persisted[4]["event_type"], "run_finished");
 }
 
 #[test]
@@ -8222,7 +8227,7 @@ async fn get_run_status_returns_state() {
         .await);
     assert_eq!(status.run_id, run.run_id);
     assert_eq!(status.status, "running");
-    assert_eq!(status.events_count, 1);
+    assert_eq!(status.events_count, 3);
     assert_eq!(status.workspace.as_ref().unwrap()["kind"], "none");
     assert_eq!(status.executor.as_ref().unwrap()["kind"], "server_local");
     assert_eq!(
@@ -9309,9 +9314,11 @@ async fn stream_run_returns_events_from_offset() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
     let events = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await);
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 3);
     assert_eq!(events[0]["event_type"], "run_started");
-    let events = ok(svc.stream_run(run.run_id, "user-1".into(), 1).await);
+    assert_eq!(events[1]["type"], "workspace_bound");
+    assert_eq!(events[2]["type"], "executor_bound");
+    let events = ok(svc.stream_run(run.run_id, "user-1".into(), 3).await);
     assert!(events.is_empty());
 }
 
@@ -10597,6 +10604,7 @@ async fn agent_binding_runtime_discovers_descriptor_capabilities_concurrently() 
                 &format!("http://{addr}/skills"),
             )),
             edge_agent: None,
+            discovery_snapshot: None,
         });
 
     let capabilities = tokio::time::timeout(
@@ -12207,11 +12215,13 @@ async fn pause_resume_round_trip_preserves_events() {
     let status = ok(svc
         .get_run_status(run.run_id.clone(), "user-1".into())
         .await);
-    assert_eq!(status.events_count, 3); // run_started + run_paused + run_resumed
+    assert_eq!(status.events_count, 5); // initial binding events + run_paused + run_resumed
     let events = ok(svc.stream_run(run.run_id, "user-1".into(), 0).await);
     assert_eq!(events[0]["event_type"], "run_started");
-    assert_eq!(events[1]["event_type"], "run_paused");
-    assert_eq!(events[2]["event_type"], "run_resumed");
+    assert_eq!(events[1]["type"], "workspace_bound");
+    assert_eq!(events[2]["type"], "executor_bound");
+    assert_eq!(events[3]["event_type"], "run_paused");
+    assert_eq!(events[4]["event_type"], "run_resumed");
 }
 
 #[tokio::test]
@@ -12612,7 +12622,7 @@ async fn cancel_run_transition_failure_does_not_commit_status_or_event() {
         .unwrap();
     assert_eq!(durable.status, STATUS_RUNNING);
     assert!(durable.waiting_for.is_none());
-    assert_eq!(durable.events.len(), 1);
+    assert_eq!(durable.events.len(), 3);
     assert_eq!(durable.events[0]["event_type"], "run_started");
 
     let runs = svc.runs.read().await;
@@ -12642,7 +12652,7 @@ async fn pause_run_transition_failure_does_not_commit_status_or_event() {
         .unwrap();
     assert_eq!(durable.status, STATUS_RUNNING);
     assert!(durable.waiting_for.is_none());
-    assert_eq!(durable.events.len(), 1);
+    assert_eq!(durable.events.len(), 3);
     assert_eq!(durable.events[0]["event_type"], "run_started");
 
     let runs = svc.runs.read().await;
@@ -12673,8 +12683,8 @@ async fn resume_run_transition_failure_does_not_commit_status_or_event() {
         .unwrap();
     assert_eq!(durable.status, STATUS_PAUSED);
     assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
-    assert_eq!(durable.events.len(), 2);
-    assert_eq!(durable.events[1]["event_type"], "run_paused");
+    assert_eq!(durable.events.len(), 4);
+    assert_eq!(durable.events[3]["event_type"], "run_paused");
 
     let runs = svc.runs.read().await;
     let live = runs.get(&run.run_id).expect("live run state");
