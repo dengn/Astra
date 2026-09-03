@@ -2186,7 +2186,7 @@ mod tests {
 
         assert_eq!(
             detect_github_remote_repos(workspace.path()),
-            vec!["matrixorigin/Astra"]
+            vec!["matrixorigin/astra"]
         );
         assert!(
             detect_github_remote_repos(workspace.path().join("missing").as_path()).is_empty(),

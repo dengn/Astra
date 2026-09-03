@@ -123,7 +123,7 @@ mod tests {
     fn github_repo_display_prefers_owner_repo_pair() {
         assert_eq!(
             github_repo_display(Some("matrixorigin"), Some("astra")).as_deref(),
-            Some("matrixorigin/Astra")
+            Some("matrixorigin/astra")
         );
         assert_eq!(
             github_repo_display(None, Some("matrixorigin/Astra")).as_deref(),
