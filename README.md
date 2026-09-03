@@ -134,19 +134,113 @@ ties Pi, finishes one task behind Hermes, and one ahead of DSH.
 
 ## Quick start
 
-The path below builds Astra from source and starts the Server-only profile. For
-Docker and production paths, use the
+Two supported paths. Both end at a working agent response. Start with
+**Docker** to evaluate Astra without a Rust or Node toolchain; **build from
+source** when you want the Web dashboard, local Runner capacity, or to change
+Astra itself. For production topologies, use the
 [getting-started guide](docs/quickstart/README.md).
 
-### Prerequisites
+| Path | What you get | Additional prerequisites |
+| --- | --- | --- |
+| [Docker](#docker) | MatrixOne, Memoria, and `astra-server` from published images, plus the prebuilt `astra` CLI | Docker Compose and OpenSSL |
+| [From source](#build-from-source) | The same backbone built locally, plus the Web dashboard and CLI-local Runner capacity | Rust 1.97 and Node.js 24, both pinned in the repository |
 
-- Git and Make
-- Docker with Docker Compose
-- Rust via `rustup` (the repository pins Rust 1.97)
-- Node.js 24 (pinned in `.nvmrc`) and OpenSSL command-line tools
-- An embedding API and at least one supported LLM endpoint
+Both paths need Git, Make, an embedding API, and at least one supported LLM
+endpoint.
 
-### 1. Initialize
+### Docker
+
+No Rust or Node toolchain. The steps below go all the way to a real agent
+response, not just a healthy port.
+
+#### 1. Start the stack
+
+```bash
+git clone https://github.com/matrixorigin/astra.git
+cd astra
+
+make stack-env
+```
+
+`make stack-env` creates `deployment/all-in-one/.env` and generates the local
+stack secrets. Fill in `MEMORIA_EMBEDDING_API_KEY` and
+`MEMORIA_EMBEDDING_BASE_URL`, then start MatrixOne, Memoria, and
+`astra-server` from published images:
+
+```bash
+make stack-up
+curl http://localhost:17001/health
+```
+
+| Service | Default URL |
+| --- | --- |
+| HTTP API | <http://localhost:17001> |
+| Health check | <http://localhost:17001/health> |
+
+#### 2. Install the CLI
+
+The stack ships the server. Install the prebuilt `astra` binary to drive it —
+Linux and macOS, `amd64` and `arm64`:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
+astra health
+```
+
+The CLI defaults to `http://127.0.0.1:17001`, which is where the stack binds.
+If you changed `ASTRA_API_PORT`, set `ASTRA_API_URL` or pass `--api-url` to
+each command. Pass `-v <version>` to the installer, and set `ASTRA_IMAGE`
+before `make stack-up`, when you need a pinned CLI and server pair.
+
+#### 3. Bootstrap the admin account
+
+```bash
+astra admin register --username admin --password '<password>'
+```
+
+On a fresh data volume this performs the initial admin bootstrap, prints
+`registered and logged in (initial admin)`, and stores the credentials in the
+local CLI profile.
+
+#### 4. Register a model
+
+```bash
+astra admin model add MODEL_NAME openai \
+  --api-key "$LLM_API_KEY" --base-url https://your-endpoint/v1
+astra admin model check MODEL_NAME
+```
+
+`model check` probes the endpoint and reports `is_active` and `connectivity`.
+A model reaches `is_active: true` only when the probe succeeds, so this is the
+step that tells you routing will work. For more than one model, write a
+`.models.yaml` and run
+`astra admin model load .models.yaml --update-existing`.
+
+#### 5. First agent response
+
+```bash
+astra chat -m "Explain what you can and cannot do in this deployment"
+astra session list
+```
+
+You are through the loop when the request returns a model response and
+`session list` shows the durable session it created.
+
+This stack is Server-only by design. Server-side agent turns, memory,
+planning, MCP, and introspection are available, while file, shell, Git,
+build/test, and private-network tools stay unavailable until a Runner
+connects — which is what the answer above should tell you. Operate the stack
+with `make stack-status`, `make stack-logs SERVICE=api`, and `make stack-down`;
+the [all-in-one guide](deployment/all-in-one/README.md) covers the
+server+edge profile and the [Docker quick start](docs/quickstart/docker.md)
+covers ports and troubleshooting.
+
+### Build from source
+
+This path builds the `astra` binary and starts the Server-only profile with the
+Web dashboard.
+
+#### 1. Initialize
 
 ```bash
 git clone https://github.com/matrixorigin/astra.git
@@ -160,7 +254,7 @@ Set `MEMORIA_EMBEDDING_API_KEY` and `MEMORIA_EMBEDDING_BASE_URL` in `.env`,
 then configure at least one provider in `.models.yaml`. Never commit either
 local file.
 
-### 2. Build and start Server-only
+#### 2. Build and start Server-only
 
 ```bash
 make build
@@ -176,7 +270,7 @@ astra health
 | HTTP API | <http://localhost:17001> |
 | Health check | <http://localhost:17001/health> |
 
-### 3. Bootstrap an account and model
+#### 3. Bootstrap an account and model
 
 The first admin registration bootstraps a fresh installation and stores its
 credentials in the local CLI profile.
@@ -195,7 +289,7 @@ You can now use the TUI or send a one-shot request:
 astra chat -m "Map this repository and explain its architecture"
 ```
 
-### 4. Add a User Runner when local execution is needed
+#### 4. Add a User Runner when local execution is needed
 
 Server-only mode deliberately has no implicit access to your machine. Connect
 a User Runner when a Web session needs local file, shell, Git, build/test, or
