@@ -198,229 +198,81 @@ ties Pi, finishes one task behind Hermes, and one ahead of DSH.
 
 ## Quick start
 
-Two supported paths, both ending at a working agent response. Start with
-**Docker** to evaluate Astra without a Rust or Node toolchain; **build from
-source** when you want the Web dashboard, CLI-local Runner capacity, or to
-change Astra itself. For production topologies, use the
-[getting-started guide](docs/quickstart/README.md).
+One path: the hosted Astra Server. The Server and Memoria are already running;
+you install the CLI, log in, and add one model API key. Nothing else to deploy.
 
-| Path | What you get | Additional prerequisites |
-| --- | --- | --- |
-| [Docker](#docker) | MatrixOne, Memoria, and `astra-server` from published images, plus prebuilt CLI and User Runner binaries | Docker Compose, OpenSSL, and Python 3.9+ |
-| [From source](#build-from-source) | The same backbone built locally, plus the Web dashboard and CLI-local Runner capacity | Rust 1.97 and Node.js 24, both pinned in the repository |
-
-Both paths need Git, Make, and at least one supported LLM endpoint. Semantic
-memory needs an embedding API; deterministic mock embeddings are also available
-for local evaluation and tests.
-
-### Docker
-
-No Rust or Node toolchain. These steps run all the way to a real agent
-response, not just a healthy port.
-
-#### 1. Install the client binaries
-
-One checksum-verified archive installs both the `astra` CLI and the
-`astra-edge` User Runner — Linux and macOS, `amd64` and `arm64`:
+### 1. Install the CLI
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh -s -- --dir "$HOME/.local/bin"
-export PATH="$HOME/.local/bin:$PATH"
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
 ```
 
-#### 2. Run the guided setup
+The script verifies the checksum and installs `astra` (and `astra-edge`) into
+`/usr/local/bin`, or `~/.local/bin` when that is not writable; pass
+`--dir PATH` to choose. Linux (`amd64`, `arm64`) and macOS (Apple Silicon,
+Intel) are supported. Linux binaries are static and need nothing else. On
+macOS the binary links against Homebrew's OpenSSL 3, so run
+`brew install openssl@3` first.
 
-Use the same version for the client and Server deployment, then follow one
-guided flow from embedding configuration through the first administrator and
-model. The installer prints these version-matched next steps as well:
+### 2. Point the CLI at the hosted Server and log in
 
 ```bash
-ASTRA_VERSION="$(astra --version | awk '{print $2}')"
-git clone --branch "v${ASTRA_VERSION}" --depth 1 https://github.com/matrixorigin/Astra.git "Astra-${ASTRA_VERSION}"
-cd "Astra-${ASTRA_VERSION}"
-make stack-setup
+astra config set api_url https://astra.thememoria.ai
+astra login
 ```
 
-The guided setup first identifies the intended local installation and prints a
-status snapshot on every run. If an older or differently configured stack
-exists, you explicitly choose whether to update it, create a separate
-installation with its own data and ports, or leave it untouched. It then
-validates the embedding endpoint, credentials, model, and vector dimension
-before starting containers. Healthy services are reused; partial services get
-explicit repair, stop, and inspect choices.
-API keys are hidden while typing and the local `.env` is owner-only. Choose mock
-embeddings for deterministic evaluation; use a real OpenAI-compatible endpoint
-for production retrieval. Mock embeddings do not provide an LLM: the model step
-still needs a supported hosted or local model endpoint. Administrator/model
-setup is optional: choose to finish the infrastructure and resume it later.
-The wizard distinguishes `Stack ready` from `Chat ready`, never deletes
-persistent volumes, and saves the selected API URL for later CLI runs.
-The released clients and full guided path support Linux, macOS, and Windows
-through WSL. Native Windows and Git Bash are not release targets yet.
+`astra login` prints a `https://thememoria.ai/connect/astra?...` link and
+waits; open it in a browser, approve, and the CLI stores the credentials in
+`~/.astra/credentials.json`. On a machine without a browser, use
+`astra login --manual` and paste a connection key from thememoria.ai.
+`astra whoami` confirms the account.
 
-For a non-interactive local evaluation, use deterministic mock embeddings:
+### 3. Add your model
+
+Astra is BYOK: the key is stored on the Server for your account and never in
+the local config. The wizard asks for provider, model id, and key (hidden
+input) and marks the model as your default:
 
 ```bash
-MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
+astra model add
 ```
 
-For semantic memory, set `MEMORIA_EMBEDDING_BASE_URL` and, when required,
-`MEMORIA_EMBEDDING_API_KEY`, then run `make stack-start`. The command generates
-local secrets, starts Compose, waits for health, and verifies an exact memory
-round trip. For lower-level automation, run `make stack-env`, `make stack-up`,
-and `make stack-verify` explicitly.
-
-| Service | Default URL |
-| --- | --- |
-| HTTP API | <http://localhost:17001> |
-| Health check | <http://localhost:17001/health> |
-
-#### 3. Confirm the CLI and service
-
-The versioned stack ships the matching `astra-server`; the prebuilt `astra`
-binary installed in step 1 drives it:
+Or non-interactively, for example with DeepSeek:
 
 ```bash
-astra health
-astra
+printf '%s' "$DEEPSEEK_API_KEY" | astra model add deepseek --provider deepseek --model deepseek-v4-flash --context-window 128000 --api-key-stdin --default
 ```
 
-`astra health` returns a non-zero status when the API reports an unhealthy or
-degraded dependency. Guided setup saves its API address in CLI settings, so a
-remapped port also works for later `astra` TUI sessions. For a manually managed
-stack, run `astra config set api_url http://127.0.0.1:<port>`. Pass `-v
-<version>` to the installer to select an older or prerelease client; always use
-its matching Git tag for the deployment checkout. MatrixOne and Memoria are
-pinned to the compatibility set exercised by that Astra release instead of
-floating on `latest`.
-
-For scripted or advanced environments, replace the guided account/model phase
-with the following two operations.
-
-##### Bootstrap the admin account
+Providers: `openai`, `anthropic`, `deepseek`, and `openai-compatible` with
+`--base-url` for GLM, Qwen, Kimi, or a gateway. `--model` is the provider's
+exact model id; the first argument is the alias you use later. Then verify
+the credential and endpoint from the Server side:
 
 ```bash
-astra admin register --username admin --password '<password>'
+astra model probe deepseek
 ```
 
-On a fresh data volume this creates the initial administrator and stores the
-returned credentials in the local CLI profile. After an administrator exists,
-the command must be run while logged in as an existing administrator.
-
-##### Register a model
+### 4. Run
 
 ```bash
-astra admin model add MODEL_NAME openai \
-  --api-key "$LLM_API_KEY" --context-window 128000 \
-  --base-url https://your-endpoint/v1
-astra admin model check MODEL_NAME
-```
-
-`model check` probes the endpoint and reports `is_active` and `connectivity`.
-A model reaches `is_active: true` only when the probe succeeds, so this is the
-step that tells you routing will work. For more than one model, write a
-`.models.yaml` and run
-`astra admin model load .models.yaml --update-existing`.
-
-#### 4. Get the first agent response
-
-```bash
-astra chat -m "Explain what you can and cannot do in this deployment"
-astra session list
-```
-
-You are through the loop when the request returns a model response and
-`session list` shows the durable session it created.
-
-This stack is Server-only by design. Server-side agent turns, memory, planning,
-MCP, and introspection are available, while file, shell, Git, build/test, and
-private-network tools stay unavailable until a Runner connects — which is what
-the answer above should tell you.
-
-#### 5. Connect a User Runner when local execution is needed
-
-After the CLI has stored your account credentials, expose one deliberate local
-workspace to the Server:
-
-```bash
-astra-edge --workspace-dir /path/to/workspace
-```
-
-The Runner inherits the selected Astra CLI profile and reconnects on transient
-disconnects. Stop it to remove that execution capacity; the Server remains
-available without ambient access to the machine. Operate the stack with
-`make stack-status`, `make stack-logs SERVICE=api`, and `make stack-down`. The
-[all-in-one guide](deployment/all-in-one/README.md) covers the server+edge
-profile; the [Docker quick start](docs/quickstart/docker.md) covers ports and
-troubleshooting.
-
-### Build from source
-
-This path builds the `astra` binary and starts the Server-only profile with the
-Web dashboard.
-
-#### 1. Initialize
-
-```bash
-git clone https://github.com/matrixorigin/Astra.git
-cd Astra
-
-cp .models.yaml.example .models.yaml
-make dev-init
-```
-
-Configure a real embedding endpoint in `.env` for semantic memory, adding an
-API key only when that endpoint requires one, or set
-`MEMORIA_EMBEDDING_PROVIDER=mock` for local evaluation. Then configure at least
-one model provider in `.models.yaml`. Never commit either local file.
-
-#### 2. Build and start Server-only
-
-```bash
-make build-cli-debug
-make dev-start
-
-export PATH="$PWD/target/debug:$PATH"
-astra health
-```
-
-| Service | Default URL |
-| --- | --- |
-| Web dashboard | <http://localhost:3536> |
-| HTTP API | <http://localhost:17001> |
-| Health check | <http://localhost:17001/health> |
-
-#### 3. Bootstrap an account and model
-
-The first admin registration bootstraps a fresh installation and stores its
-credentials in the local CLI profile.
-
-```bash
-astra admin register
-astra admin model load .models.yaml --update-existing
-astra admin model check YOUR_MODEL_NAME
-
-astra
-```
-
-You can now use the TUI or send a one-shot request:
-
-```bash
+astra                                   # interactive TUI; type / for commands
 astra chat -m "Map this repository and explain its architecture"
+astra chat -y --explain verbose -m "Count the .sh files here with a shell command"
 ```
 
-#### 4. Add a User Runner when local execution is needed
+File, shell, and Git tools run on this machine inside the current directory;
+the Server only sees tool results. One-shot `chat` cannot ask for approval,
+so pass `-y` (or `--permission-mode auto`) when the task needs tools; the
+TUI prompts instead. `--explain verbose` prints the Explain Analyze DAG for
+the turn.
 
-Server-only mode deliberately has no implicit access to your machine. Connect
-a User Runner when a Web session needs local file, shell, Git, build/test, or
-private-network capacity:
+If a command returns `401`, the access token has expired: run
+`astra refresh`. `astra doctor` checks the install, Server, and login in
+one go. Sessions and journals live under `~/.astra`.
 
-```bash
-ASTRA_EDGE_WORKSPACE_DIR=/path/to/workspace make dev-edge-start
-```
-
-Use `make dev-start-server-edge` on later starts to bring up the Server, Web
-dashboard, and local User Runner together.
+To run the Server yourself instead, see the
+[deployment overview](deployment/README.md) and the
+[Docker quick start](docs/quickstart/docker.md).
 
 ## Use Astra
 
