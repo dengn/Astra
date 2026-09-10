@@ -55,8 +55,9 @@ Explain Analyze DAG — turn-1
 
 <sub>Abbreviated output of a real one-shot turn against a hosted Astra Server with `deepseek-v4-flash`. Every line answers a question a database engineer already knows how to ask: what was the budget, what did each source cost, what was dropped, and did the cache hit.</sub>
 
-Astra ships as one binary (CLI, TUI, and Server), plus a Web dashboard and a
-TypeScript SDK sharing one agent backbone. Bring any model endpoint.
+Astra ships as one binary: the CLI, the TUI, and the Server. Bring any model
+endpoint. Self-hosted deployments add a Web dashboard and a TypeScript SDK on
+the same backbone.
 
 <div align="center">
   <img alt="Recorded terminal session: astra chat --explain verbose answers a question, then prints the Explain Analyze DAG for the turn — token counts, context assembly budget, prompt breakdown by source, tool surface, memory retrieval, and per-round timing." src="docs/assets/astra-cli-demo.gif" width="900">
